@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import shutil
 import asyncio
 import aiohttp
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType, ContentType
@@ -23,6 +24,10 @@ CACHE_DIR = os.path.join(
 )
 MAX_FILE_MB = 50  # 单首歌大小上限
 MAX_CACHE_FILES = 200  # 缓存文件数上限，超出删最旧的
+MAX_CANDIDATES = 6  # 一次播放最多尝试的候选歌曲数
+MIN_DURATION_S = 90  # 低于该时长视为试听片段，不采用
+# 音源可靠度排序（靠前的优先尝试）；千千/咪咕常返回加密或无效音频，放最后
+SOURCE_PREFERENCE = ["kuwo", "netease", "kugou", "joox", "qianqian", "migu"]
 
 play_online_music_function_desc = {
     "type": "function",
@@ -63,28 +68,20 @@ async def play_online_music(conn: "ConnectionHandler", song_name: str, artist: s
             artist = ""
         conn.logger.bind(tag=TAG).info(f"在线播放请求: {song_name} - {artist}")
 
-        song = await _search_song(song_name, artist)
-        if song is None:
+        songs = await _search_songs(song_name, artist)
+        if not songs:
             return ActionResponse(
                 action=Action.RESPONSE,
                 result=f"未找到歌曲: {song_name}",
                 response=f"抱歉，没有搜到《{song_name}》",
             )
 
-        url, final_song = await _resolve_url(song)
-        if not url:
-            return ActionResponse(
-                action=Action.RESPONSE,
-                result=f"无法获取播放链接: {song_name}",
-                response=f"《{final_song.get('name', song_name)}》暂时拿不到播放链接，换个平台试试或换首歌吧",
-            )
-
-        music_path = await _download(url, final_song)
+        music_path, final_song = await _try_candidates(conn, songs)
         if not music_path:
             return ActionResponse(
                 action=Action.RESPONSE,
-                result="下载失败",
-                response="歌曲下载失败了，请稍后再试",
+                result=f"无法获取可播放的音频: {song_name}",
+                response=f"《{song_name}》暂时拿不到能播放的音频，请稍后再试或换首歌",
             )
 
         text = f"正在为您播放，《{final_song.get('name', song_name)}》"
@@ -100,6 +97,35 @@ async def play_online_music(conn: "ConnectionHandler", song_name: str, artist: s
         return ActionResponse(
             action=Action.RESPONSE, result=str(e), response="播放在线音乐时出错了"
         )
+
+
+async def _try_candidates(conn, songs):
+    """按顺序尝试候选歌曲：本地缓存优先，未缓存则取链下载并校验"""
+    tried = set()
+    for song in songs[:MAX_CANDIDATES]:
+        key = (song.get("source"), song.get("id"))
+        if key in tried:
+            continue
+        tried.add(key)
+        # 1) 命中本地缓存（校验通过才可用），完全跳过在线取链
+        path = _cache_path(song)
+        if await _cache_usable(path):
+            conn.logger.bind(tag=TAG).info(f"命中本地缓存: {path}")
+            return path, song
+        # 2) 取链（失败自动 switch 换平台）→ 下载 → ffprobe 校验
+        url, final_song = await _resolve_url(song)
+        if not url:
+            conn.logger.bind(tag=TAG).info(
+                f"取链失败，换下一候选: {song.get('name')}({song.get('source')})"
+            )
+            continue
+        path = await _download(url, final_song)
+        if path:
+            return path, final_song
+        conn.logger.bind(tag=TAG).info(
+            f"下载/校验失败，换下一候选: {final_song.get('name')}({final_song.get('source')})"
+        )
+    return None, None
 
 
 async def _api_get(path, params=None, timeout=15):
@@ -123,7 +149,15 @@ def _song_query_params(song):
     return params
 
 
-async def _search_song(song_name, artist):
+def _source_rank(song):
+    source = song.get("source") or ""
+    return (
+        SOURCE_PREFERENCE.index(source) if source in SOURCE_PREFERENCE else len(SOURCE_PREFERENCE)
+    )
+
+
+async def _search_songs(song_name, artist):
+    """搜索并排序：歌名命中 > 歌手命中 > 源可靠度。返回候选列表"""
     q = f"{song_name} {artist}".strip()
     try:
         data = await _api_get("/api/v1/music/search", {"q": q, "type": "song"})
@@ -131,16 +165,13 @@ async def _search_song(song_name, artist):
         raise RuntimeError(f"搜索接口失败: {e}") from e
     body = data.get("data") or data
     songs = body.get("songs") or body.get("list") or []
-    if not songs:
-        return None
-    # 优先歌名包含关键词的结果，其次歌手匹配
-    for s in songs:
-        if song_name and song_name in (s.get("name") or ""):
-            return s
-    for s in songs:
-        if artist and artist in (s.get("artist") or ""):
-            return s
-    return songs[0]
+
+    def score(s):
+        name_hit = 2 if song_name and song_name in (s.get("name") or "") else 0
+        artist_hit = 1 if artist and artist in (s.get("artist") or "") else 0
+        return (name_hit + artist_hit, -_source_rank(s))
+
+    return sorted(songs, key=score, reverse=True)
 
 
 async def _resolve_url(song):
@@ -175,13 +206,98 @@ def _safe_filename(name):
     return re.sub(r'[\\/:*?"<>|\s]+', "_", str(name))[:80] or "song"
 
 
-async def _download(url, song):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    fname = _safe_filename(f"{song.get('name', 'song')}-{song.get('artist', '')}-{song.get('source', '')}") + ".mp3"
-    path = os.path.join(CACHE_DIR, fname)
-    if os.path.exists(path) and os.path.getsize(path) > 1024:
-        return path  # 命中缓存
+def _cache_path(song):
+    fname = _safe_filename(
+        f"{song.get('name', 'song')}-{song.get('artist', '')}-{song.get('source', '')}"
+    ) + ".mp3"
+    return os.path.join(CACHE_DIR, fname)
 
+
+async def _cache_usable(path):
+    """缓存文件存在且可解码。有 .ok 标记直接可用（避免重复 ffprobe）；
+    旧缓存没有标记则现场校验一次，通过即补标记，不通过删文件"""
+    if not os.path.exists(path) or os.path.getsize(path) <= 1024:
+        return False
+    if os.path.exists(path + ".ok"):
+        return True
+    if await _ffprobe_valid(path):
+        return True
+    _remove_quiet(path)
+    return False
+
+
+def _tool_bin(name):
+    """优先 PATH 里的 ffmpeg/ffprobe，找不到则用 conda env bin 下的（服务以 conda PATH
+    启动，但保险起见兜底查找，避免 PATH 丢失时误判所有音频无效）"""
+    found = shutil.which(name)
+    if found:
+        return found
+    candidate = os.path.join(os.sys.prefix, "bin", name)
+    return candidate if os.path.exists(candidate) else name
+
+
+async def _probe_audio(path):
+    """ffprobe 探测音频信息，返回 (codec_name, channels, duration) 或 None"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _tool_bin("ffprobe"),
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,codec_type,channels:format=duration",
+            "-of", "json",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        info = json.loads(stdout.decode() or "{}")
+        stream = (info.get("streams") or [{}])[0]
+        if stream.get("codec_type") != "audio" or int(stream.get("channels") or 0) <= 0:
+            return None
+        duration = float((info.get("format") or {}).get("duration") or 0)
+        return stream.get("codec_name"), int(stream.get("channels")), duration
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _transcode_to_mp3(src, dst):
+    """转码为标准 mp3。TTS 管线（PyAV）按扩展名识别格式，
+    FLAC/M4A 等内容伪装 .mp3 会导致解码失败，必须转成真 mp3"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _tool_bin("ffmpeg"),
+            "-v", "error", "-y",
+            "-i", src,
+            "-vn", "-acodec", "libmp3lame", "-ar", "44100", "-ab", "128k",
+            dst,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=120)
+        return proc.returncode == 0 and os.path.getsize(dst) > 1024
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _ffprobe_valid(path):
+    """缓存可用性检查：必须是完整歌曲（>=90s，挡住 30s 试听片段）的真 mp3。
+    通过写 .ok 标记避免重复探测"""
+    probed = await _probe_audio(path)
+    if probed is None:
+        return False
+    codec, _channels, duration = probed
+    if codec != "mp3" or duration < 90:
+        return False
+    with open(path + ".ok", "w") as f:
+        f.write(f"{codec}:{duration}")
+    return True
+
+
+async def _download(url, song):
+    path = _cache_path(song)
+    _remove_quiet(path)
+    _remove_quiet(path + ".ok")
+    raw = path + ".part"
     try:
         timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -189,27 +305,53 @@ async def _download(url, song):
                 if resp.status != 200:
                     return None
                 total = 0
-                with open(path + ".part", "wb") as f:
+                with open(raw, "wb") as f:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         total += len(chunk)
                         if total > MAX_FILE_MB * 1024 * 1024:
                             f.close()
-                            os.remove(path + ".part")
+                            _remove_quiet(raw)
                             return None
                         f.write(chunk)
         if total < 1024:  # 太小多半是错误页
-            os.remove(path + ".part")
+            _remove_quiet(raw)
             return None
-        os.rename(path + ".part", path)
+        # 校验：必须是音频流、时长>=90s（挡住试听片段/坏文件）
+        probed = await _probe_audio(raw)
+        if probed is None:
+            _remove_quiet(raw)
+            return None
+        codec, _channels, duration = probed
+        if duration < MIN_DURATION_S:
+            _remove_quiet(raw)
+            return None
+        if codec != "mp3":
+            # FLAC/M4A 等伪装 .mp3 会让 TTS 管道（PyAV）解码失败，转成真 mp3
+            transcoded = path + ".mp3.part"
+            if not await _transcode_to_mp3(raw, transcoded):
+                _remove_quiet(raw)
+                _remove_quiet(transcoded)
+                return None
+            _remove_quiet(raw)
+            os.rename(transcoded, path)
+        else:
+            os.rename(raw, path)
+        with open(path + ".ok", "w") as f:
+            f.write(f"{codec}:{duration}")
         _evict_cache()
         return path
     except Exception:  # noqa: BLE001
-        if os.path.exists(path + ".part"):
-            try:
-                os.remove(path + ".part")
-            except OSError:
-                pass
+        _remove_quiet(raw)
+        _remove_quiet(path)
         return None
+
+
+def _remove_quiet(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def _evict_cache():
@@ -217,16 +359,14 @@ def _evict_cache():
         files = [
             os.path.join(CACHE_DIR, f)
             for f in os.listdir(CACHE_DIR)
-            if not f.endswith(".part")
+            if not f.endswith(".part") and not f.endswith(".ok")
         ]
         if len(files) <= MAX_CACHE_FILES:
             return
         files.sort(key=lambda p: os.path.getmtime(p))
         for p in files[: len(files) - MAX_CACHE_FILES]:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            _remove_quiet(p)
+            _remove_quiet(p + ".ok")
     except OSError:
         pass
 
