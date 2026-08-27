@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 from core.utils.dialogue import Message
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.receiveAudioHandle import startToChat
+from core.handle.abortHandle import handleAbortMessage
 from core.handle.reportHandle import enqueue_asr_report
 from core.handle.sendAudioHandle import send_stt_message, send_tts_message
 from core.handle.textMessageHandler import TextMessageHandler
@@ -33,8 +34,15 @@ class ListenTextMessageHandler(TextMessageHandler):
                 f"客户端拾音模式：{conn.client_listen_mode}"
             )
         if msg_json["state"] == "start":
-            # 设备从播放模式切回录音模式,清除所有音频状态和缓冲区
-            conn.reset_audio_states()
+            # 设备从播放模式切回录音模式
+            if conn.client_is_speaking and conn.client_listen_mode != "manual":
+                # 服务端正在播音频(TTS/音乐)时用户开口,立即打断:
+                # 停止推流+清空队列+通知设备,否则音频流(如整首歌)会继续推完,
+                # 设备回到播放态后会接着播旧音频,表现为"打断不起作用"
+                await handleAbortMessage(conn)
+            else:
+                # 清除所有音频状态和缓冲区
+                conn.reset_audio_states()
         elif msg_json["state"] == "stop":
             # 收到stop但asr未初始化，跳过处理
             if conn.asr is None:
