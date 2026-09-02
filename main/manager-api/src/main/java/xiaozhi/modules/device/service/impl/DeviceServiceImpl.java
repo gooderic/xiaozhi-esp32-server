@@ -9,6 +9,7 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -78,6 +79,13 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
     private final RedisUtils redisUtils;
     private final OtaService otaService;
     private final DeviceAddressBookService deviceAddressBookService;
+
+    /**
+     * WebSocket直连设备在线判定的活跃窗口（分钟）。
+     * 网关只能看到走MQTT的设备，WS直连的设备不在网关连接表中；
+     * 用 last_connected_at（每轮对话上报都会刷新）近似：窗口内有过对话即视为在线。
+     */
+    private static final int WS_PRESENCE_ACTIVE_MINUTES = 10;
 
     @Async
     public void updateDeviceConnectionInfo(String agentId, String deviceId, String appVersion) {
@@ -160,6 +168,7 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         // 从系统参数中获取MQTT网关地址
         String mqttGatewayUrl = sysParamsService.getValue("server.mqtt_manager_api", true);
         if (StringUtils.isBlank(mqttGatewayUrl) || "null".equals(mqttGatewayUrl)) {
+            log.warn("MQTT网关地址未配置(server.mqtt_manager_api)，无法获取设备在线状态，请登录智控台参数管理配置");
             return "";
         }
         // 构建完整的URL
@@ -169,23 +178,67 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         UserDetail user = SecurityUser.getUser();
         List<DeviceEntity> devices = getUserDevices(user.getId(), agentId);
 
-        // 构建deviceIds数组
-        Set<String> deviceIds = devices.stream().map(o -> {
-            String macAddress = Optional.ofNullable(o.getMacAddress()).orElse("unknown").replace(":", "_");
-            String groupId = Optional.ofNullable(o.getBoard()).orElse("GID_default").replace(":", "_");
-            return StrUtil.format("{}@@@{}@@@{}", groupId, macAddress, macAddress);
-        }).collect(Collectors.toSet());
+        // 构建deviceIds数组（附带小写变体，兼容设备上报MAC/board大小写不一致）
+        Set<String> deviceIds = devices.stream()
+                .flatMap(o -> buildMqttClientIds(o).stream())
+                .collect(Collectors.toSet());
+
+        if (CollUtil.isEmpty(deviceIds)) {
+            return "";
+        }
 
         // 构建请求入参
         Map<String, Set<String>> params = MapUtil
                 .builder(new HashMap<String, Set<String>>())
                 .put("clientIds", deviceIds).build();
 
-        if (CollUtil.isNotEmpty(deviceIds)) {
-            return postToMqttGateway(url, params);
+        String gatewayResponse = "";
+        try {
+            gatewayResponse = postToMqttGateway(url, params);
+        } catch (Exception e) {
+            log.error("查询MQTT网关设备在线状态失败 url={} err={}", url, e.getMessage());
         }
-        // 返回响应
-        return "";
+        return mergeWsPresence(gatewayResponse, devices);
+    }
+
+    /**
+     * 在网关在线状态之上合并 WebSocket 直连设备的在线判定。
+     * 网关连接表中不存在的设备，若 last_connected_at 距今不超过
+     * {@link #WS_PRESENCE_ACTIVE_MINUTES} 分钟，则补一条在线记录，
+     * 使前端（设备管理/通讯录）对 WS 直连设备显示在线。
+     * 网关已返回 exists 的设备保持网关结果不动。
+     */
+    private String mergeWsPresence(String gatewayResponse, List<DeviceEntity> devices) {
+        JSONObject parsed = new JSONObject();
+        if (StringUtils.isNotBlank(gatewayResponse)) {
+            try {
+                parsed = JSONUtil.parseObj(gatewayResponse);
+            } catch (Exception e) {
+                log.warn("解析网关在线状态响应失败: {}", StrUtil.subPre(gatewayResponse, 200));
+            }
+        }
+        final JSONObject statusMap = parsed;
+        long threshold = System.currentTimeMillis() - WS_PRESENCE_ACTIVE_MINUTES * 60 * 1000L;
+        for (DeviceEntity device : devices) {
+            Date lastConnectedAt = device.getLastConnectedAt();
+            if (lastConnectedAt == null || lastConnectedAt.getTime() < threshold) {
+                continue;
+            }
+            Set<String> clientIds = buildMqttClientIds(device);
+            boolean seenByGateway = clientIds.stream().anyMatch(id -> {
+                JSONObject entry = statusMap.getJSONObject(id);
+                return entry != null && entry.getBool("exists", false);
+            });
+            if (seenByGateway) {
+                continue;
+            }
+            JSONObject presence = new JSONObject();
+            presence.set("isAlive", true);
+            presence.set("exists", true);
+            // 与前端一致使用原始形式（未转小写）的 clientId
+            statusMap.set(clientIds.iterator().next(), presence);
+        }
+        return statusMap.toString();
     }
 
     @Override
@@ -696,11 +749,28 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
                 Instant.now());
     }
 
+    /**
+     * 构建设备的MQTT clientId候选集（原始形式 + 小写形式）
+     *
+     * @param device 设备实体
+     * @return clientId候选集，用于兼容设备上报MAC/board与数据库存储大小写不一致的情况
+     */
+    private Set<String> buildMqttClientIds(DeviceEntity device) {
+        String macAddress = Optional.ofNullable(device.getMacAddress()).orElse("unknown").replace(":", "_");
+        String groupId = Optional.ofNullable(device.getBoard()).orElse("GID_default").replace(":", "_");
+        String clientId = StrUtil.format("{}@@@{}@@@{}", groupId, macAddress, macAddress);
+        Set<String> clientIds = new LinkedHashSet<>();
+        clientIds.add(clientId);
+        clientIds.add(clientId.toLowerCase());
+        return clientIds;
+    }
+
     @Override
     public Object getDeviceTools(String deviceId) {
         // 从系统参数中获取MQTT网关地址
         String mqttGatewayUrl = sysParamsService.getValue("server.mqtt_manager_api", true);
         if (StringUtils.isBlank(mqttGatewayUrl) || "null".equals(mqttGatewayUrl)) {
+            log.warn("MQTT网关地址未配置(server.mqtt_manager_api)，无法获取设备工具列表，请登录智控台参数管理配置");
             return null;
         }
 
@@ -716,78 +786,19 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
             return null;
         }
 
-        // 构建clientId
-        String macAddress = Optional.ofNullable(device.getMacAddress()).orElse("unknown").replace(":", "_");
-        String groupId = Optional.ofNullable(device.getBoard()).orElse("GID_default").replace(":", "_");
-        String clientId = StrUtil.format("{}@@@{}@@@{}", groupId, macAddress, macAddress);
-
-        // 构建完整的URL
-        String url = StrUtil.format("http://{}/api/commands/{}", mqttGatewayUrl, clientId);
-
-        // 存储所有工具列表
+        // 依次尝试clientId候选（原始大小写/小写），取第一个有结果的形式
         List<Object> allTools = new ArrayList<>();
-        String cursor = null;
-
-        // 循环获取分页数据
-        while (true) {
-            // 构建params
-            Map<String, Object> paramsMap = MapUtil.builder(new HashMap<String, Object>())
-                    .put("withUserTools", true)
-                    .build();
-            // 如果有cursor，添加到请求参数中
-            if (StringUtils.isNotBlank(cursor)) {
-                paramsMap.put("cursor", cursor);
-            }
-
-            // 构建请求体
-            Map<String, Object> payload = MapUtil
-                    .builder(new HashMap<String, Object>())
-                    .put("jsonrpc", "2.0")
-                    .put("id", 2)
-                    .put("method", "tools/list")
-                    .put("params", paramsMap)
-                    .build();
-
-            Map<String, Object> requestBody = MapUtil
-                    .builder(new HashMap<String, Object>())
-                    .put("type", "mcp")
-                    .put("payload", payload)
-                    .build();
-
-            String resultMessage = postToMqttGateway(url, requestBody);
-
-            // 解析响应
-            if (StringUtils.isBlank(resultMessage)) {
+        for (String clientId : buildMqttClientIds(device)) {
+            allTools = queryDeviceTools(mqttGatewayUrl, clientId);
+            if (!allTools.isEmpty()) {
                 break;
             }
-
-            JSONObject jsonObject = JSONUtil.parseObj(resultMessage);
-            if (!jsonObject.getBool("success", false)) {
-                break;
-            }
-
-            JSONObject data = jsonObject.getJSONObject("data");
-            if (data == null) {
-                break;
-            }
-
-            // 获取当前页的工具列表
-            JSONArray tools = data.getJSONArray("tools");
-            if (tools != null && !tools.isEmpty()) {
-                allTools.addAll(tools);
-            }
-
-            // 获取下一页的cursor
-            String nextCursor = data.getStr("nextCursor");
-            if (StringUtils.isBlank(nextCursor)) {
-                // 没有下一页了
-                break;
-            }
-            cursor = nextCursor;
         }
 
         // 构建返回结果
         if (allTools.isEmpty()) {
+            log.warn("获取设备工具列表为空 deviceId={} clientIds={}（设备可能未通过MQTT网关连接）", deviceId,
+                    buildMqttClientIds(device));
             return null;
         }
 
@@ -796,11 +807,89 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
         return resultData;
     }
 
+    /**
+     * 分页查询MQTT网关上的设备工具列表
+     *
+     * @param mqttGatewayUrl MQTT网关地址
+     * @param clientId       设备clientId
+     * @return 工具列表
+     */
+    private List<Object> queryDeviceTools(String mqttGatewayUrl, String clientId) {
+        List<Object> allTools = new ArrayList<>();
+        String url = StrUtil.format("http://{}/api/commands/{}", mqttGatewayUrl, clientId);
+        String cursor = null;
+
+        try {
+            // 循环获取分页数据
+            while (true) {
+                // 构建params
+                Map<String, Object> paramsMap = MapUtil.builder(new HashMap<String, Object>())
+                        .put("withUserTools", true)
+                        .build();
+                // 如果有cursor，添加到请求参数中
+                if (StringUtils.isNotBlank(cursor)) {
+                    paramsMap.put("cursor", cursor);
+                }
+
+                // 构建请求体
+                Map<String, Object> payload = MapUtil
+                        .builder(new HashMap<String, Object>())
+                        .put("jsonrpc", "2.0")
+                        .put("id", 2)
+                        .put("method", "tools/list")
+                        .put("params", paramsMap)
+                        .build();
+
+                Map<String, Object> requestBody = MapUtil
+                        .builder(new HashMap<String, Object>())
+                        .put("type", "mcp")
+                        .put("payload", payload)
+                        .build();
+
+                String resultMessage = postToMqttGateway(url, requestBody);
+
+                // 解析响应
+                if (StringUtils.isBlank(resultMessage)) {
+                    break;
+                }
+
+                JSONObject jsonObject = JSONUtil.parseObj(resultMessage);
+                if (!jsonObject.getBool("success", false)) {
+                    break;
+                }
+
+                JSONObject data = jsonObject.getJSONObject("data");
+                if (data == null) {
+                    break;
+                }
+
+                // 获取当前页的工具列表
+                JSONArray tools = data.getJSONArray("tools");
+                if (tools != null && !tools.isEmpty()) {
+                    allTools.addAll(tools);
+                }
+
+                // 获取下一页的cursor
+                String nextCursor = data.getStr("nextCursor");
+                if (StringUtils.isBlank(nextCursor)) {
+                    // 没有下一页了
+                    break;
+                }
+                cursor = nextCursor;
+            }
+        } catch (Exception e) {
+            log.error("请求MQTT网关获取工具列表失败 url={} err={}", url, e.getMessage());
+        }
+        return allTools;
+    }
+
     @Override
     public Object callDeviceTool(String deviceId, String toolName, Map<String, Object> arguments) {
         // 从系统参数中获取MQTT网关地址
         String mqttGatewayUrl = sysParamsService.getValue("server.mqtt_manager_api", true);
         if (StringUtils.isBlank(mqttGatewayUrl) || "null".equals(mqttGatewayUrl)) {
+            log.warn("MQTT网关地址未配置(server.mqtt_manager_api)，无法调用设备工具[{}]，请登录智控台参数管理配置",
+                    toolName);
             return null;
         }
 
@@ -816,11 +905,30 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
             return null;
         }
 
-        // 构建clientId
-        String macAddress = Optional.ofNullable(device.getMacAddress()).orElse("unknown").replace(":", "_");
-        String groupId = Optional.ofNullable(device.getBoard()).orElse("GID_default").replace(":", "_");
-        String clientId = StrUtil.format("{}@@@{}@@@{}", groupId, macAddress, macAddress);
+        // 依次尝试clientId候选（原始大小写/小写），取第一个成功的形式
+        for (String clientId : buildMqttClientIds(device)) {
+            Object result = callGatewayCommand(mqttGatewayUrl, clientId, toolName, arguments);
+            if (result != null) {
+                return result;
+            }
+        }
 
+        log.warn("调用设备工具失败 tool={} deviceId={} clientIds={}（设备可能未通过MQTT网关连接）", toolName, deviceId,
+                buildMqttClientIds(device));
+        return null;
+    }
+
+    /**
+     * 通过MQTT网关调用设备MCP工具并解析响应
+     *
+     * @param mqttGatewayUrl MQTT网关地址
+     * @param clientId       设备clientId
+     * @param toolName       工具名称
+     * @param arguments      调用参数
+     * @return 解析后的结果，失败返回null
+     */
+    private Object callGatewayCommand(String mqttGatewayUrl, String clientId, String toolName,
+            Map<String, Object> arguments) {
         // 构建完整的URL
         String url = StrUtil.format("http://{}/api/commands/{}", mqttGatewayUrl, clientId);
 
@@ -845,7 +953,13 @@ public class DeviceServiceImpl extends BaseServiceImpl<DeviceDao, DeviceEntity> 
                 .put("payload", payload)
                 .build();
 
-        String resultMessage = postToMqttGateway(url, requestBody);
+        String resultMessage;
+        try {
+            resultMessage = postToMqttGateway(url, requestBody);
+        } catch (Exception e) {
+            log.error("请求MQTT网关失败 url={} tool={} err={}", url, toolName, e.getMessage());
+            return null;
+        }
 
         // 解析响应
         if (StringUtils.isNotBlank(resultMessage)) {
