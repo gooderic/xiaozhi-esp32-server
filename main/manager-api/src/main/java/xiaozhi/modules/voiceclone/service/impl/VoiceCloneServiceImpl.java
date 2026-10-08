@@ -4,6 +4,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -290,7 +291,7 @@ public class VoiceCloneServiceImpl extends BaseServiceImpl<VoiceCloneDao, VoiceC
                 throw new RenException(ErrorCode.VOICE_CLONE_MODEL_TYPE_NOT_FOUND);
             }
             if (Constant.VOICE_CLONE_HUOSHAN_DOUBLE_STREAM.equals(type)) {
-                huoshanClone(config, entity);
+                huoshanClone2(config, entity);
             }
         } catch (RenException re) {
             entity.setTrainStatus(3);
@@ -385,6 +386,73 @@ public class VoiceCloneServiceImpl extends BaseServiceImpl<VoiceCloneDao, VoiceC
                 throw new RenException(errorMsg);
             }
             throw new RenException(ErrorCode.VOICE_CLONE_RESPONSE_FORMAT_ERROR);
+        }
+    }
+
+    /**
+     * 调用火山引擎v3接口进行语音复刻训练
+     *
+     * @param config 模型配置
+     * @param entity 语音克隆记录实体
+     * @throws Exception
+     */
+    private void huoshanClone2(Map<String, Object> config, VoiceCloneEntity entity) throws Exception {
+        String API_URL = "https://openspeech.bytedance.com/api/v3/tts/voice_clone";
+        String API_KEY = System.getenv("HUOSHAN_VOICE_CLONE_API_KEY");
+        if (StringUtils.isBlank(API_KEY)) {
+            throw new RenException(ErrorCode.VOICE_CLONE_HUOSHAN_CONFIG_MISSING);
+        }
+        String SPEAKER_ID = "S_TL9Lo8L82";
+        String audioBase64 = Base64.getEncoder().encodeToString(entity.getVoice());
+        String requestBody = """
+                {
+                  "speaker_id": "%s",
+                  "audio": {
+                    "data": "%s",
+                    "format": "wav"
+                  },
+                  "language": 1,
+                  "extra_params": {
+                    "voice_clone_denoise_model_id": "",
+                    "demo_text": "hello,this is a test"
+                  }
+                }
+                """.formatted(SPEAKER_ID, audioBase64);
+        String requestId = UUID.randomUUID().toString();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(API_URL))
+                .header("Content-Type", "application/json")
+                .header("X-Api-Key", API_KEY)
+                .header("X-Api-Request-Id", requestId)
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
+        HttpClient client = HttpClient.newHttpClient();
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println(">>> HTTP status = " + response.statusCode());
+        System.out.println(">>> response body = " + response.body());
+
+        Map<String, Object> rsp = objectMapper.readValue(response.body(),
+                new TypeReference<Map<String, Object>>() {
+                });
+        String statusMessage = objectMapper.convertValue(rsp.get("message"), String.class);
+        if (response.statusCode() != 200) {
+            if (StringUtils.isNotBlank(statusMessage)) {
+                throw new RenException(statusMessage);
+            }
+            throw new RenException(ErrorCode.VOICE_CLONE_RESPONSE_FORMAT_ERROR);
+        }
+
+        String speakerId = objectMapper.convertValue(rsp.get("speaker_id"), String.class);
+        int status = objectMapper.convertValue(rsp.get("status"), Integer.class);
+        if ((status == 2 || status == 4) && StringUtils.isNotBlank(speakerId)) {
+            entity.setTrainStatus(2);
+            entity.setVoiceId(speakerId);
+            entity.setTrainError("");
+            baseDao.updateById(entity);
+        } else {
+            String errorMsg = StringUtils.isNotBlank(statusMessage) ? statusMessage : "训练失败";
+            throw new RenException(errorMsg);
         }
     }
 }
